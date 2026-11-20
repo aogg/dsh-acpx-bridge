@@ -1,0 +1,26 @@
+# dsh 本地数据目录：含会话记录与凭证，绝对不能提交
+.dsh-home/
+.dsh-home-clean/
+
+# acpx 本地配置文件
+.acpxrc.json
+
+# Node.js 依赖目录
+node_modules/
+# node_modules 以符号链接形式存在时 git 视作文件，同样忽略
+node_modules
+
+# 日志文件
+*.log
+
+# macOS 系统文件
+.DS_Store
+
+# 环境变量 / 密钥文件
+.env
+
+# 构建产物
+dist/
+
+# 工具元数据目录（如存在）
+.workbuddy/

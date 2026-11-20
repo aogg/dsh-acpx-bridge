@@ -1,0 +1,69 @@
+#!/usr/bin/env node
+/**
+ * mock-acpx — a stand-in for the real `acpx` binary, used ONLY for local
+ * end-to-end verification of the dsh-acpx-bridge plugin when no real acpx /
+ * coding agent is installed. It understands exactly the argv the plugin emits:
+ *
+ *   acpx --format <fmt> --approve-<policy> [--cwd DIR] <agent> exec "<task>"
+ *   acpx --format <fmt> --approve-<policy> [--cwd DIR] <agent> -s <name> "<task>"
+ *   acpx <agent> sessions new --name <name>
+ *
+ * Set ACPX_BIN to the absolute path of this file to use it.
+ */
+const args = process.argv.slice(2)
+
+function pick(list, flag) {
+  const i = list.indexOf(flag)
+  return i >= 0 ? list[i + 1] : undefined
+}
+
+let format = 'text'
+let agent = 'unknown'
+let task = ''
+let session
+
+const fmtIdx = args.indexOf('--format')
+if (fmtIdx >= 0) {
+  format = args[fmtIdx + 1]
+  args.splice(fmtIdx, 2)
+}
+// strip permission + cwd globals
+for (const flag of ['--approve-all', '--approve-reads', '--deny-all']) {
+  const i = args.indexOf(flag)
+  if (i >= 0) args.splice(i, 1)
+}
+const cwdIdx = args.indexOf('--cwd')
+if (cwdIdx >= 0) args.splice(cwdIdx, 2)
+
+if (args.includes('sessions') && args.includes('new')) {
+  const name = pick(args, '--name')
+  console.log(`mock-session-${name}-${Date.now().toString(36)}`)
+  process.exit(0)
+}
+
+agent = args.shift() || 'unknown'
+if (args[0] === 'exec') args.shift()
+if (args[0] === '-s') {
+  args.shift()
+  session = args.shift()
+}
+task = args.join(' ')
+
+const result = {
+  ok: true,
+  mock: true,
+  agent,
+  session,
+  mode: session ? 'session' : 'exec',
+  format,
+  task,
+  answer: `[mock ${agent}] Task received and "completed": ${task.slice(0, 160)}`,
+}
+
+if (format === 'json') {
+  // NDJSON ACP-like events
+  console.log(JSON.stringify({ method: 'session/update', params: { sessionUpdate: 'agent_message_chunk', text: result.answer } }))
+  console.log(JSON.stringify({ method: 'session/update', params: { sessionUpdate: 'end_turn' } }))
+} else {
+  console.log(result.answer)
+}

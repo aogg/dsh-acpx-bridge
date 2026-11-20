@@ -1,0 +1,22 @@
+{
+  "name": "dsh-acpx-bridge",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: an acpx_delegate tool that lets the model drive other coding agents via acpx (ACP).",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["dsh", "deepseek-harness", "acpx", "acp", "subagent", "dsh-plugin"],
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.0 <1.0.0",
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "entry": "src/index.js"
+  },
+  "scripts": {
+    "selftest": "node src/selftest.mjs"
+  }
+}

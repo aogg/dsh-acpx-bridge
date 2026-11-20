@@ -1,0 +1,5 @@
+# 本地开发/测试挂载：把 acpx-bridge 插件插入 dsh web profile
+# 用法：npx @deepseek-ai/dsh web --patch ./cordis.patch.yml
+- insert:
+    - id: acpx-bridge
+      name: '/Applications/code/www/my/github/dsh-acpx-bridge/src/index.js'

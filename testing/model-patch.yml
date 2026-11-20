@@ -1,0 +1,20 @@
+# 让 dsh 默认使用本地 mock-workbuddy provider（端到端测试用）
+- id: llm-pi-ai
+  config:
+    providers:
+      mock-workbuddy:
+        apiKeyEnv: MOCK_LLM_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8899/v1
+        compat:
+          supportsDeveloperRole: false
+          maxTokensField: max_tokens
+        models:
+          - id: gs/deepseek-flash-deepseek.com
+            contextWindow: 131072
+            maxTokens: 8192
+
+- id: agent-default-model
+  config:
+    provider: mock-workbuddy
+    model: gs/deepseek-flash-deepseek.com
