@@ -24,3 +24,6 @@ dist/
 
 # 工具元数据目录（如存在）
 .workbuddy/
+
+# IDE 工作区元数据
+.openidea/

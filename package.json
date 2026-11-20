@@ -7,14 +7,24 @@
   "keywords": ["dsh", "deepseek-harness", "acpx", "acp", "subagent", "dsh-plugin"],
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./client": "./client/index.js"
   },
   "engines": {
     "dsh": ">=0.2.2-rc.0 <1.0.0",
     "node": ">=22.19.0"
   },
   "dsh": {
-    "entry": "src/index.js"
+    "entry": "src/index.js",
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
   },
   "scripts": {
     "selftest": "node src/selftest.mjs"

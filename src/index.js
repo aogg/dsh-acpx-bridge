@@ -7,6 +7,9 @@
  *
  *   model (inside dsh)  --calls-->  acpx_delegate tool  --spawns-->  acpx <agent> exec "<task>"
  *
+ * It also registers an LLM adapter so configured models appear in dsh's model
+ * selector and real calls go to an OpenAI-compatible endpoint (see config.js).
+ *
  * Why a tool instead of a subagent provider:
  *   acpx itself is an ACP *client* with 30 built-in agent profiles and a stable
  *   one-shot `exec` command. Wrapping it as a single tool is the smallest, most
@@ -17,11 +20,14 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { Config, PROVIDER, allModelIds, resolveConfig } from './config.js'
+import { AcpxBridgeAdapter } from './llm-adapter.js'
 
 const execFileAsync = promisify(execFile)
 
 export const name = 'acpx-bridge'
-export const inject = ['tools']
+export const inject = ['tools', 'llm']
+export { Config }
 
 // ---------------------------------------------------------------------------
 // Configuration (env-overridable; no credentials stored here)
@@ -61,6 +67,7 @@ export function buildAcpxArgs({
   session,
   approve = DEFAULT_APPROVE,
   format = DEFAULT_FORMAT,
+  model,
 } = {}) {
   if (!task || typeof task !== 'string') {
     throw new TypeError('buildAcpxArgs: `task` must be a non-empty string')
@@ -75,6 +82,7 @@ export function buildAcpxArgs({
   else if (approve === 'none') args.push('--deny-all')
   else args.push('--approve-reads') // default
 
+  if (model) args.push('--model', model)
   if (cwd) args.push('--cwd', cwd)
 
   args.push(agent)
@@ -113,15 +121,30 @@ function truncateForStore(text) {
 // Plugin
 // ---------------------------------------------------------------------------
 
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
+  const options = resolveConfig(config)
+  const tools = options.tools
+  const agentChoices = tools.length ? tools.map(tool => tool.name) : KNOWN_AGENTS
+  const defaultAgent = agentChoices[0] || DEFAULT_AGENT
+  const modelIds = allModelIds(tools)
+  const modelsByAgent = new Map(tools.map(tool => [tool.name, tool.models ?? []]))
+
+  // Register the LLM adapter so configured models appear in dsh's model selector.
+  const adapter = new AcpxBridgeAdapter({
+    ...options,
+    tools: () => resolveConfig(config).tools,
+  })
+  ctx.llm.registerAdapter([PROVIDER], adapter)
+  ctx.emit('llm/models-updated', PROVIDER)
+  ctx.on('loader/volatile-update', () => ctx.emit('llm/models-updated', PROVIDER))
+
   ctx.tools.register(defineTool({
     name: 'acpx_delegate',
     description:
       'Delegate a coding task to another AI coding agent through acpx (headless ACP client). ' +
       'Use this to parallelise work or hand a task to a specialised agent. ' +
-      `Available built-in agents include: ${KNOWN_AGENTS.join(', ')}. ` +
-      'Choose `agent` by the task: codex/claude/gemini for heavy coding, ' +
-      'qwen/kimi/glm-style agents for cost, deepseek-harness for another DSH runtime. ' +
+      `Configured agents: ${agentChoices.join(', ')}. ` +
+      `Agent → models: ${tools.map(tool => `${tool.name}=[${(tool.models ?? []).join(', ')}]`).join('; ') || 'none'}. ` +
       'Pass a self-contained task description — the child agent cannot see this conversation. ' +
       'For a throwaway run keep mode=exec; use mode=session with a `session` name to keep ' +
       'a persistent, resumable conversation scoped to the repo. ' +
@@ -134,7 +157,13 @@ export function apply(ctx) {
       },
       agent: {
         type: 'string',
-        description: `acpx agent profile to use. One of ${KNOWN_AGENTS.join(', ')} or a custom name. Defaults to ${DEFAULT_AGENT}.`,
+        enum: agentChoices,
+        description: `Configured command tool (acpx agent profile). Defaults to ${defaultAgent}.`,
+      },
+      model: {
+        type: 'string',
+        enum: modelIds,
+        description: `Optional model id for this agent, passed to acpx as --model. Choices: ${modelIds.join(', ') || 'none'}.`,
       },
       cwd: {
         type: 'string',
@@ -193,7 +222,8 @@ export function apply(ctx) {
       const started = Date.now()
       const {
         task,
-        agent = DEFAULT_AGENT,
+        agent = defaultAgent,
+        model,
         cwd,
         mode = 'exec',
         session,
@@ -213,6 +243,19 @@ export function apply(ctx) {
         durationMs: 0,
       }
 
+      // Reject a model that is not declared under the selected command tool.
+      if (model) {
+        const allowed = modelsByAgent.get(agent) ?? []
+        if (allowed.length && !allowed.includes(model)) {
+          return {
+            ...base,
+            ok: false,
+            diagnostic: `model "${model}" is not configured for agent "${agent}" (allowed: ${allowed.join(', ')})`,
+            durationMs: Date.now() - started,
+          }
+        }
+      }
+
       // For session mode, best-effort create the named session first.
       if (mode === 'session' && session) {
         try {
@@ -228,7 +271,7 @@ export function apply(ctx) {
 
       let argv
       try {
-        argv = buildAcpxArgs({ agent, task, cwd, mode, session, approve, format })
+        argv = buildAcpxArgs({ agent, task, cwd, mode, session, approve, format, model })
       } catch (err) {
         return {
           ...base,
@@ -282,15 +325,26 @@ export function apply(ctx) {
     },
   }))
 
-  // A small companion tool: list known agents + report which binaries exist.
+  // A small companion tool: list configured command tools + their models.
   ctx.tools.register(defineTool({
     name: 'acpx_agents',
-    description: 'List acpx built-in agent profiles available for acpx_delegate.',
+    description: 'List configured acpx command tools (agents), their models, and built-in agent profiles.',
     parameters: {},
     output: {
       schema: {
         type: 'object',
         properties: {
+          tools: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                models: { type: 'array', items: { type: 'string' } },
+              },
+              additionalProperties: false,
+            },
+          },
           known: { type: 'array', items: { type: 'string' } },
           count: { type: 'number' },
           note: { type: 'string' },
@@ -298,14 +352,21 @@ export function apply(ctx) {
         additionalProperties: false,
       },
       render: (_args, value) => [
-        { type: 'text', text: `${value.count} acpx agents:\n${value.known.join(', ')}\n\n${value.note}` },
+        {
+          type: 'text',
+          text: `${value.count} configured tools:\n`
+            + value.tools.map(tool => `- ${tool.name}: ${tool.models.join(', ') || '(no models)'}`).join('\n')
+            + `\n\nBuilt-in acpx agents: ${value.known.join(', ')}\n\n${value.note}`,
+        },
       ],
     },
     async execute() {
+      const current = resolveConfig(config).tools
       return {
+        tools: current,
         known: KNOWN_AGENTS,
-        count: KNOWN_AGENTS.length,
-        note: `Using acpx binary: ${ACPX_BIN}. Any custom ACP server can also be reached with --agent.`,
+        count: current.length,
+        note: `Using acpx binary: ${ACPX_BIN}. LLM provider: ${PROVIDER}.`,
       }
     },
   }))

@@ -1,5 +1,9 @@
 # 本地开发/测试挂载：把 acpx-bridge 插件插入 dsh web profile
-# 用法：npx @deepseek-ai/dsh web --patch ./cordis.patch.yml
+# 用法：ACPX_BRIDGE_API_KEY=<key> npx @deepseek-ai/dsh web --patch ./cordis.patch.yml
+# 密钥只从环境变量注入，绝不写入本文件。
+# baseURL 可用 ACPX_BRIDGE_BASE_URL 覆盖（不设置则用 config.js 里的默认端点）。
 - insert:
     - id: acpx-bridge
       name: '/Applications/code/www/my/github/dsh-acpx-bridge/src/index.js'
+      config:
+        apiKey: !!js process.env.ACPX_BRIDGE_API_KEY ?? ''
