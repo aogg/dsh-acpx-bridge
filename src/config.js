@@ -36,6 +36,12 @@ const ToolSchema = z.object({
 export const Config = z.object({
   /** Command tools (acpx agents) and the models offered under each one. */
   tools: z.array(ToolSchema).default(DEFAULT_TOOLS).volatile(),
+  /**
+   * Optional `<selector model id> -> <wire model id>` overrides. Only needed
+   * when the endpoint expects a different id than the one in the selector;
+   * otherwise the full configured id is sent as-is.
+   */
+  wireModels: z.dict(z.string()).default({}).volatile(),
   /** OpenAI-compatible API key. Empty by default; supply via env/cordis. */
   apiKey: z.string().default('').volatile(),
   /** OpenAI-compatible endpoint root (without /chat/completions). */
@@ -54,9 +60,10 @@ function read(value) {
  */
 export function resolveConfig(config = {}) {
   const tools = read(config.tools) ?? DEFAULT_TOOLS
+  const wireModels = read(config.wireModels) ?? {}
   const apiKey = read(config.apiKey) || process.env[API_KEY_ENV] || ''
   const baseURL = read(config.baseURL) || process.env[BASE_URL_ENV] || DEFAULT_BASE_URL
-  return { tools, apiKey, baseURL: baseURL.replace(/\/+$/, '') }
+  return { tools, wireModels, apiKey, baseURL: baseURL.replace(/\/+$/, '') }
 }
 
 /** Deduplicated list of every model id declared under every command tool. */
@@ -74,19 +81,78 @@ export function allModelIds(tools) {
 }
 
 /**
- * Selector display name. `gs/deepseek-flash-deepseek.com` → `acpx/deepseek-flash`.
+ * Short base label of a model id: `gs/deepseek-flash-deepseek.com` →
+ * `deepseek-flash`, `my/opencode/deepseek-v4.1-flash-free` →
+ * `deepseek-v4.1-flash-free`.
  */
-export function displayNameForModel(id) {
+export function baseDisplayName(id) {
   let name = String(id)
   if (name.includes('/')) name = name.slice(name.lastIndexOf('/') + 1)
-  name = name.replace(/-deepseek\.com$/i, '')
-  return `acpx/${name}`
+  return name.replace(/-deepseek\.com$/i, '')
 }
 
 /**
- * Wire model id sent to the OpenAI-compatible endpoint. The proxy expects the
- * bare model name (`deepseek-flash`), not the WorkBuddy routing key.
+ * Selector display names for every configured model, guaranteed unique.
+ *
+ * The name is `acpx/<last path segment>`. When two different model ids share
+ * that segment, both are disambiguated with the owning command tool as
+ * `acpx/<agent>:<segment>` so the selector never shows two identical entries.
+ * Returns a Map<modelId, displayName>.
  */
-export function toWireModel(id) {
-  return displayNameForModel(id).replace(/^acpx\//, '')
+export function modelDisplayNames(tools) {
+  /** @type {Map<string, string[]>} modelId -> owning tool names */
+  const owners = new Map()
+  for (const tool of tools ?? []) {
+    for (const id of tool.models ?? []) {
+      const list = owners.get(id) ?? []
+      if (!list.includes(tool.name)) list.push(tool.name)
+      owners.set(id, list)
+    }
+  }
+
+  /** @type {Map<string, string[]>} base label -> model ids sharing it */
+  const byBase = new Map()
+  for (const id of owners.keys()) {
+    const base = baseDisplayName(id)
+    byBase.set(base, [...(byBase.get(base) ?? []), id])
+  }
+
+  const names = new Map()
+  for (const [base, ids] of byBase) {
+    if (ids.length === 1) {
+      names.set(ids[0], `acpx/${base}`)
+      continue
+    }
+    for (const id of ids) {
+      const owner = (owners.get(id) ?? ['unknown'])[0]
+      names.set(id, `acpx/${owner}:${base}`)
+    }
+  }
+  return names
+}
+
+/**
+ * Selector display name for one model id. Pass `tools` to get the
+ * collision-safe name used in the model selector.
+ */
+export function displayNameForModel(id, tools) {
+  if (tools) {
+    const names = modelDisplayNames(tools)
+    if (names.has(id)) return names.get(id)
+  }
+  return `acpx/${baseDisplayName(id)}`
+}
+
+/**
+ * Wire model id sent to the OpenAI-compatible endpoint.
+ *
+ * The endpoint is addressed by the *full* configured id (e.g.
+ * `my/opencode/deepseek-v4.1-flash-free`), so the id is forwarded verbatim.
+ * `wireModels` is an explicit escape hatch for endpoints that expect another
+ * spelling; it wins when present.
+ */
+export function toWireModel(id, wireModels) {
+  const key = String(id)
+  const mapped = wireModels && typeof wireModels === 'object' ? wireModels[key] : undefined
+  return mapped !== undefined && mapped !== '' ? String(mapped) : key
 }

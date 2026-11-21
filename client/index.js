@@ -21,16 +21,67 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
   const h = React.createElement
 
   const PROVIDER = 'acpx-bridge'
+  // Mirrors the live tool/model configuration (see the profile's
+  // cordis.patch.yml). `default` means "not yet discovered — placeholder".
   const TOOLS = [
+    { name: 'antigravity', models: ['default'] },
     { name: 'deepseek-harness', models: ['gs/deepseek-flash-deepseek.com'] },
+    { name: 'kimi', models: ['default'] },
+    { name: 'kiro', models: ['default'] },
+    { name: 'qoder', models: ['default'] },
+    { name: 'qwen', models: ['default'] },
+    { name: 'trae', models: ['default'] },
+    {
+      name: 'opencode',
+      models: [
+        'my/opencode/deepseek-v4.1-flash-free',
+        'my/opencode/mimo-v2.6-flash-free',
+        'my/opencode/flint-40b-free',
+      ],
+    },
+    { name: 'codebuddy', models: ['default'] },
   ]
 
-  /** gs/deepseek-flash-deepseek.com -> acpx/deepseek-flash (same rule as src/config.js). */
-  function selectorName(id) {
+  /** Same rule as src/config.js baseDisplayName: keep the last path segment. */
+  function baseName(id) {
     let name = String(id)
     if (name.includes('/')) name = name.slice(name.lastIndexOf('/') + 1)
-    name = name.replace(/-deepseek\.com$/i, '')
-    return 'acpx/' + name
+    return name.replace(/-deepseek\.com$/i, '')
+  }
+
+  /** Same rule as src/config.js modelDisplayNames: unique per model id. */
+  function selectorNames(tools) {
+    var owners = new Map()
+    tools.forEach(function (tool) {
+      tool.models.forEach(function (id) {
+        var list = owners.get(id) || []
+        if (list.indexOf(tool.name) === -1) list.push(tool.name)
+        owners.set(id, list)
+      })
+    })
+    var byBase = new Map()
+    owners.forEach(function (_owners, id) {
+      var base = baseName(id)
+      byBase.set(base, (byBase.get(base) || []).concat([id]))
+    })
+    var names = new Map()
+    byBase.forEach(function (ids, base) {
+      if (ids.length === 1) {
+        names.set(ids[0], 'acpx/' + base)
+        return
+      }
+      ids.forEach(function (id) {
+        names.set(id, 'acpx/' + (owners.get(id) || ['unknown'])[0] + ':' + base)
+      })
+    })
+    return names
+  }
+
+  const NAMES = selectorNames(TOOLS)
+
+  /** Selector label for one configured model id. */
+  function selectorName(id) {
+    return NAMES.get(id) || 'acpx/' + baseName(id)
   }
 
   const C = {
@@ -50,7 +101,7 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
   /** The card body rendered on the plugin's detail page. */
   function CardBody() {
     return h('div', { style: C.wrap },
-      h('h2', { style: C.h2 }, 'acpx-bridge 命令工具与模型'),
+      h('h2', { style: C.h2 }, 'acpx-bridge 命令工具与模型（9 个 agent）'),
       h('p', { style: C.lead },
         '本插件把命令工具（acpx agent）与模型分组配置，并将每个模型映射到 dsh 模型选择框中的一个选项。'),
       TOOLS.map((tool, i) => h('div', { key: i, style: C.card },
@@ -63,7 +114,8 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
       )),
       h('div', { style: C.note },
         '选择框里的 ' + TOOLS.flatMap(t => t.models).map(selectorName).join('、')
-        + ' 即来自此配置；对应的 provider 是 ' + PROVIDER + '。'),
+        + ' 即来自此配置；对应的 provider 是 ' + PROVIDER + '。'
+        + ' 模型 id 写 `default` 的表示该 agent 还没探测到真实模型名（仅占位）。'),
       h('div', { style: C.foot },
         '配置来源：src/config.js 的 tools（volatile）。当前只读展示；编辑请修改插件配置后重启。'),
     )
@@ -72,7 +124,7 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
   /** Registered card component; the renderer passes view='summary'|'page'. */
   function AcpxBridgeCard(props) {
     if (props && props.view === 'summary') {
-      return h('span', null, '命令工具与模型 → 选择框映射（deepseek-harness / acpx-deepseek-flash）')
+      return h('span', null, '命令工具与模型 → 选择框映射（9 个 acpx agent / 免费模型）')
     }
     return h(CardBody)
   }

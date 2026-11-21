@@ -19,6 +19,7 @@ export class AcpxBridgeAdapter extends LlmAdapter {
     this.connection = {
       baseURL: resolved.baseURL,
       apiKey: resolved.apiKey,
+      wireModels: resolved.wireModels ?? {},
     }
     // May be a function so volatile config updates are visible on the next read.
     this.tools = resolved.tools ?? []
@@ -33,10 +34,11 @@ export class AcpxBridgeAdapter extends LlmAdapter {
   }
 
   async listModels(provider) {
-    return allModelIds(this.currentTools()).map(id => ({
+    const tools = this.currentTools()
+    return allModelIds(tools).map(id => ({
       provider,
       id,
-      name: displayNameForModel(id),
+      name: displayNameForModel(id, tools),
       description: 'acpx-bridge / OpenAI-compatible endpoint',
       inputModalities: ['text'],
     }))
@@ -46,7 +48,7 @@ export class AcpxBridgeAdapter extends LlmAdapter {
     return {
       provider,
       id: model,
-      name: displayNameForModel(model),
+      name: displayNameForModel(model, this.currentTools()),
       inputModalities: ['text'],
       context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
       defaultMaxTokens: DEFAULT_MAX_TOKENS,
@@ -55,7 +57,7 @@ export class AcpxBridgeAdapter extends LlmAdapter {
 
   stream(options) {
     return streamChatCompletion(
-      { ...options, wireModel: toWireModel(options.model) },
+      { ...options, wireModel: toWireModel(options.model, this.connection.wireModels) },
       this.connection,
     )
   }
