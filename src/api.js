@@ -1,24 +1,40 @@
 /**
- * The plugin's small HTTP surface, mounted on the harness Web server.
+ * The plugin's small HTTP surface.
  *
- * Four exact routes under `/api/acpx-bridge/`:
+ * Four exact Fetch routes under `/api/acpx-bridge/`, registered through the
+ * harness Connection service (`ctx.connection.fetch.register`) instead of the
+ * raw Web server. That matters for security: Connection mounts one physical
+ * `/api` prefix route that first runs `connection.admit(req)` — the Host/Origin
+ * fence plus browser-session authentication — and only then dispatches to these
+ * route handlers. A LAN client with no browser session therefore never reaches
+ * them, and a plain `webServer.register` route would have been unauthenticated.
+ *
  *   GET  /state        everything the settings page renders (never a secret)
- *   PUT  /prefs        validated partial preference update
- *   POST /verify       one real minimal chat/completions probe
+ *   POST /prefs        validated partial preference update
+ *   POST /verify       one real minimal chat/completions probe (2s cooldown)
  *   POST /acpx-check   `acpx --version` (path + version)
  *
- * Security rules, all enforced here rather than in the client:
- *   - same-origin only: when `Origin` is present it must match `Host`, and a
+ * `ConnectionFetchMethod` (the platform contract) is GET/HEAD/POST, so the two
+ * write routes use POST; an empty `{}` patch is a no-op that still announces the
+ * model list.
+ *
+ * Layered defences, all enforced here rather than in the client:
+ *   - same-origin check as a SECOND layer (the first is Connection's admit):
+ *     when `Origin` is present it must match `Host`, and a
  *     `sec-fetch-site: cross-site` marker is refused outright (403);
  *   - writes require `content-type: application/json` (415);
  *   - request bodies are capped at 64 KiB (413);
  *   - no CORS headers are ever emitted, so a foreign page can neither read a
  *     response nor preflight a write;
- *   - errors are `{ error: { code, message } }` and never carry a secret.
+ *   - errors are `{ error: { code, message } }` and never carry a secret;
+ *   - `/verify` is serialized with a 2s cooldown (429) so a double click cannot
+ *     burn provider tokens.
  *
  * Everything that can be unit-tested without a socket is a pure function:
  * same-origin judgement, body reading/limits, catalog + counts, response shape,
  * the verify probe (injectable fetch) and the acpx probe (injectable exec).
+ * Handlers take a WHATWG `Request` and return a `Response`, so tests drive them
+ * directly with no server.
  */
 
 import { execFile } from 'node:child_process'
@@ -43,14 +59,31 @@ export const ROUTES = Object.freeze({
   acpxCheck: `${API_PREFIX}/acpx-check`,
 })
 
+/** Methods each route declares to Connection (the contract allows GET/HEAD/POST). */
+export const ROUTE_METHODS = Object.freeze({
+  state: Object.freeze(['GET']),
+  prefs: Object.freeze(['POST']),
+  verify: Object.freeze(['POST']),
+  acpxCheck: Object.freeze(['POST']),
+})
+
 /** Request-body cap for every write route. */
 export const MAX_BODY_BYTES = 64 * 1024
 /** Timeout of one verify probe. */
 export const VERIFY_TIMEOUT_MS = 15_000
+/** Minimum gap between two accepted verify probes. */
+export const VERIFY_COOLDOWN_MS = 2_000
 /** Timeout of one `acpx --version` probe. */
 export const ACPX_CHECK_TIMEOUT_MS = 10_000
 /** Longest provider error excerpt echoed back to the page. */
 const MAX_ERROR_CHARS = 300
+
+/** Headers every JSON response carries (deliberately no CORS header). */
+const JSON_HEADERS = Object.freeze({
+  'content-type': 'application/json; charset=utf-8',
+  'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff',
+})
 
 const execFileAsync = promisify(execFile)
 
@@ -59,8 +92,8 @@ const execFileAsync = promisify(execFile)
 // ---------------------------------------------------------------------------
 
 /**
- * Read one header from a plain Node header bag or a Fetch `Headers`.
- * @param headers - `req.headers` or a Headers instance.
+ * Read one header from a Fetch `Headers` or a plain Node header bag.
+ * @param headers - `Request.headers` / `req.headers`.
  * @param name - lowercase header name.
  * @returns the first string value, or undefined.
  */
@@ -89,9 +122,11 @@ function parseAuthority(authority) {
 /**
  * Same-origin fence for every route of this plugin.
  *
- * A browser sends `Origin` on cross-origin fetches and on same-origin unsafe
- * methods, so comparing it with the `Host` header rejects a foreign page
- * driving this API while leaving ordinary same-origin requests untouched.
+ * This is the SECOND layer: the first is Connection's `admit()`, which the
+ * physical `/api` carrier runs before any route handler (Host/Origin fence plus
+ * browser-session authentication). Comparing `Origin` with `Host` here is
+ * defence in depth — it keeps the handlers safe even if they were ever mounted
+ * on a bare Web route.
  * @param headers - request headers.
  * @returns true when the request may be served.
  */
@@ -118,71 +153,56 @@ export function isJsonContentType(headers) {
   return raw.split(';', 1)[0].trim().toLowerCase() === 'application/json'
 }
 
+/** One JSON response; no CORS headers are ever added. */
+export function jsonResponse(status, payload) {
+  return new Response(JSON.stringify(payload), { status, headers: JSON_HEADERS })
+}
+
+/** One `{ error: { code, message } }` response. */
+export function errorResponse(status, code, message) {
+  return jsonResponse(status, { error: { code, message } })
+}
+
 /**
  * Read and parse a JSON request body under a byte cap.
- * @param req - Node IncomingMessage (or an async iterable of Buffers/Uint8Arrays).
+ *
+ * Connection buffers the body (its own `maxRequestBodyBytes` is the hard
+ * transport cap); this is the application-level 64 KiB policy for a narrow
+ * preferences write.
+ * @param request - Fetch request.
  * @param options.limit - byte cap, default {@link MAX_BODY_BYTES}.
- * @returns `{ ok: true, value }` or `{ ok: false, code, message }`.
+ * @returns `{ ok: true, value }` or `{ ok: false, status, code, message }`.
  */
-export async function readJsonBody(req, { limit = MAX_BODY_BYTES } = {}) {
-  const tooLarge = { ok: false, code: 'body-too-large', message: `请求体超过 ${limit} 字节上限` }
-  // A declared length lets us refuse before touching the stream, which keeps
-  // the socket intact long enough to deliver the 413.
-  const declared = headerOf(req?.headers, 'content-length')
+export async function readRequestJson(request, { limit = MAX_BODY_BYTES } = {}) {
+  const tooLarge = {
+    ok: false,
+    status: 413,
+    code: 'body-too-large',
+    message: `请求体超过 ${limit} 字节上限`,
+  }
+  const declared = headerOf(request?.headers, 'content-length')
   if (typeof declared === 'string' && /^\d+$/.test(declared) && Number(declared) > limit) {
     return tooLarge
   }
-  const chunks = []
-  let size = 0
-  let oversized = false
+  let text
   try {
-    for await (const chunk of req) {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-      size += buffer.length
-      if (size > limit) {
-        // Keep draining a chunked body up to a hard cap instead of returning
-        // from inside `for await` (an early return destroys the request stream
-        // and can lose the response). Beyond the cap the client is abusive and
-        // the connection is dropped.
-        oversized = true
-        if (size > limit * 8) {
-          req.destroy?.()
-          break
-        }
-        continue
-      }
-      chunks.push(buffer)
-    }
+    text = await request.text()
   } catch (error) {
-    return { ok: false, code: 'body-read-failed', message: `读取请求体失败：${error?.message ?? error}` }
+    return { ok: false, status: 400, code: 'body-read-failed', message: `读取请求体失败：${error?.message ?? error}` }
   }
-  if (oversized) return tooLarge
-  if (size === 0) return { ok: true, value: {} }
+  if (Buffer.byteLength(text, 'utf8') > limit) return tooLarge
+  if (text.trim() === '') return { ok: true, value: {} }
   let parsed
   try {
-    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    parsed = JSON.parse(text)
   } catch {
-    return { ok: false, code: 'invalid-json', message: '请求体不是合法 JSON' }
+    // Expected branch: the client sent a non-JSON body (not a server fault).
+    return { ok: false, status: 400, code: 'invalid-json', message: '请求体不是合法 JSON' }
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { ok: false, code: 'invalid-body', message: '请求体必须是 JSON 对象' }
+    return { ok: false, status: 400, code: 'invalid-body', message: '请求体必须是 JSON 对象' }
   }
   return { ok: true, value: parsed }
-}
-
-/** Send one JSON response; deliberately no CORS headers. */
-export function sendJson(res, status, payload) {
-  if (res.headersSent) return
-  res.statusCode = status
-  res.setHeader('content-type', 'application/json; charset=utf-8')
-  res.setHeader('cache-control', 'no-store')
-  res.setHeader('x-content-type-options', 'nosniff')
-  res.end(JSON.stringify(payload))
-}
-
-/** Send one `{ error: { code, message } }` response. */
-export function sendError(res, status, code, message) {
-  sendJson(res, status, { error: { code, message } })
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +410,7 @@ function defaultIsExecutable(file) {
     accessSync(file, fsConstants.X_OK)
     return true
   } catch {
+    // Expected branch: the file is missing or not executable.
     return false
   }
 }
@@ -454,54 +475,65 @@ export async function checkAcpx({
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Handlers (WHATWG Fetch in, Response out)
 // ---------------------------------------------------------------------------
 
 /**
- * Build the four route handlers.
+ * Build the four route handlers plus the Connection Fetch route descriptors.
  *
- * @param options.store - the preference store (`update`/`read`).
+ * @param options.store - the preference store (`update`/`reset`).
  * @param options.snapshot - async () => the `/state` body.
- * @param options.verify - async () => verify result.
+ * @param options.verify - async () => verify probe result.
  * @param options.acpxCheck - async ({ force }) => acpx probe result.
  * @param options.onPrefsChanged - called after a committed preference write.
  * @param options.logger - receives contained handler failures.
- * @returns the handlers plus the `[{ path, handler }]` route list.
+ * @param options.now - injectable clock (used by the verify cooldown).
+ * @returns handlers plus `routes: [{ path, methods, requestBody, fetch }]`.
  */
-export function createApiHandlers({ store, snapshot, verify, acpxCheck, onPrefsChanged, logger = null } = {}) {
-  const guard = (req, res, { method, json = false } = {}) => {
-    if (req.method !== method) {
-      sendError(res, 405, 'method-not-allowed', `该接口只支持 ${method}`)
-      return false
+export function createApiHandlers({
+  store,
+  snapshot,
+  verify,
+  acpxCheck,
+  onPrefsChanged,
+  logger = null,
+  now = () => Date.now(),
+} = {}) {
+  // `/verify` cost control: one probe in flight, and at least VERIFY_COOLDOWN_MS
+  // between two accepted probes. Both survive across requests in this closure.
+  let verifyInFlight = false
+  let lastVerifyStartedAt = null
+
+  /** Method + same-origin (+ optional JSON content type) gate. */
+  const guard = (request, { method, jsonBody = false }) => {
+    if (request.method !== method) {
+      return errorResponse(405, 'method-not-allowed', `该接口只支持 ${method}`)
     }
-    if (!isSameOrigin(req.headers)) {
-      sendError(res, 403, 'cross-origin', '只接受同源请求')
-      return false
+    if (!isSameOrigin(request.headers)) {
+      return errorResponse(403, 'cross-origin', '只接受同源请求')
     }
-    if (json && !isJsonContentType(req.headers)) {
-      sendError(res, 415, 'unsupported-media-type', 'Content-Type 必须是 application/json')
-      return false
+    if (jsonBody && !isJsonContentType(request.headers)) {
+      return errorResponse(415, 'unsupported-media-type', 'Content-Type 必须是 application/json')
     }
-    return true
+    return null
   }
 
-  async function stateHandler(req, res) {
-    if (!guard(req, res, { method: 'GET' })) return
+  async function stateHandler(request) {
+    const gate = guard(request, { method: 'GET' })
+    if (gate !== null) return gate
     try {
-      sendJson(res, 200, await snapshot())
+      return jsonResponse(200, await snapshot())
     } catch (error) {
       logger?.warn?.(`[acpx-bridge] state snapshot failed: ${error?.message ?? error}`)
-      sendError(res, 500, 'state-failed', '读取插件状态失败')
+      return errorResponse(500, 'state-failed', '读取插件状态失败')
     }
   }
 
-  async function prefsHandler(req, res) {
-    if (!guard(req, res, { method: 'PUT', json: true })) return
-    const body = await readJsonBody(req)
-    if (!body.ok) {
-      sendError(res, body.code === 'body-too-large' ? 413 : 400, body.code, body.message)
-      return
-    }
+  async function prefsHandler(request) {
+    const gate = guard(request, { method: 'POST', jsonBody: true })
+    if (gate !== null) return gate
+    const body = await readRequestJson(request)
+    if (!body.ok) return errorResponse(body.status, body.code, body.message)
     // `{ reset: true }` is a control flag, not a stored field: it discards the
     // document back to defaults (the page's two-step reset button).
     const wantsReset = body.value.reset === true
@@ -512,8 +544,7 @@ export function createApiHandlers({ store, snapshot, verify, acpxCheck, onPrefsC
         : await store.update(body.value)
     } catch (error) {
       logger?.warn?.(`[acpx-bridge] preference write failed: ${error?.message ?? error}`)
-      sendError(res, 500, 'prefs-write-failed', '保存设置失败')
-      return
+      return errorResponse(500, 'prefs-write-failed', '保存设置失败')
     }
     try {
       onPrefsChanged?.(prefs)
@@ -521,32 +552,41 @@ export function createApiHandlers({ store, snapshot, verify, acpxCheck, onPrefsC
       logger?.warn?.(`[acpx-bridge] model-list announcement failed: ${error?.message ?? error}`)
     }
     try {
-      sendJson(res, 200, { ok: true, prefs, state: await snapshot() })
+      return jsonResponse(200, { ok: true, prefs, state: await snapshot() })
     } catch (error) {
       logger?.warn?.(`[acpx-bridge] post-write snapshot failed: ${error?.message ?? error}`)
-      sendJson(res, 200, { ok: true, prefs })
+      return jsonResponse(200, { ok: true, prefs })
     }
   }
 
-  async function verifyHandler(req, res) {
-    if (!guard(req, res, { method: 'POST' })) return
-    req.resume?.()
+  async function verifyHandler(request) {
+    const gate = guard(request, { method: 'POST' })
+    if (gate !== null) return gate
+    const startedAt = now()
+    const cooling = lastVerifyStartedAt !== null && startedAt - lastVerifyStartedAt < VERIFY_COOLDOWN_MS
+    if (verifyInFlight || cooling) {
+      return errorResponse(429, 'verify-too-frequent', `测试连接过于频繁，请等待 ${VERIFY_COOLDOWN_MS}ms 后再试`)
+    }
+    verifyInFlight = true
+    lastVerifyStartedAt = startedAt
     try {
-      sendJson(res, 200, await verify())
+      return jsonResponse(200, await verify())
     } catch (error) {
       logger?.warn?.(`[acpx-bridge] verify probe failed: ${error?.message ?? error}`)
-      sendJson(res, 200, { ok: false, latencyMs: 0, model: '', status: 0, error: '测试连接执行失败' })
+      return jsonResponse(200, { ok: false, latencyMs: 0, model: '', status: 0, error: '测试连接执行失败' })
+    } finally {
+      verifyInFlight = false
     }
   }
 
-  async function acpxCheckHandler(req, res) {
-    if (!guard(req, res, { method: 'POST' })) return
-    req.resume?.()
+  async function acpxCheckHandler(request) {
+    const gate = guard(request, { method: 'POST' })
+    if (gate !== null) return gate
     try {
-      sendJson(res, 200, await acpxCheck({ force: true }))
+      return jsonResponse(200, await acpxCheck({ force: true }))
     } catch (error) {
       logger?.warn?.(`[acpx-bridge] acpx probe failed: ${error?.message ?? error}`)
-      sendJson(res, 200, { ok: false, path: '', version: '', error: '检测 acpx 失败' })
+      return jsonResponse(200, { ok: false, path: '', version: '', error: '检测 acpx 失败' })
     }
   }
 
@@ -556,10 +596,10 @@ export function createApiHandlers({ store, snapshot, verify, acpxCheck, onPrefsC
     verify: verifyHandler,
     acpxCheck: acpxCheckHandler,
     routes: [
-      { path: ROUTES.state, handler: stateHandler },
-      { path: ROUTES.prefs, handler: prefsHandler },
-      { path: ROUTES.verify, handler: verifyHandler },
-      { path: ROUTES.acpxCheck, handler: acpxCheckHandler },
+      { path: ROUTES.state, methods: ROUTE_METHODS.state, requestBody: 'buffered', fetch: stateHandler },
+      { path: ROUTES.prefs, methods: ROUTE_METHODS.prefs, requestBody: 'buffered', fetch: prefsHandler },
+      { path: ROUTES.verify, methods: ROUTE_METHODS.verify, requestBody: 'buffered', fetch: verifyHandler },
+      { path: ROUTES.acpxCheck, methods: ROUTE_METHODS.acpxCheck, requestBody: 'buffered', fetch: acpxCheckHandler },
     ],
   }
 }

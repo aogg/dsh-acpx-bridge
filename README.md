@@ -41,7 +41,7 @@ dsh 里的模型 ──tool call──▶ acpx_delegate ──spawn──▶ acp
 - 密钥只进本机凭据库（引用名 `ACPX_BRIDGE_API_KEY`），**不落盘到任何设置文件**，页面只显示「已配置 / 未配置」；
 - 模型/端点/默认参数的偏好写在 `<DSH_HOME>/storages/acpx-bridge/prefs.json`（原子写，目录 0700、文件 0600），不碰 profile 的 `cordis.patch.yml`；
 - 模型开关即时生效：选择器重新拉取、被停用模型不再出现，`acpx_delegate` 执行时也会拒绝；
-- 页面自带 4 个同源限定的接口：`GET /api/acpx-bridge/state`、`PUT /api/acpx-bridge/prefs`、`POST /api/acpx-bridge/verify`、`POST /api/acpx-bridge/acpx-check`。
+- 页面自带 4 个接口，注册在 dsh Connection 的鉴权 Fetch 路由上（浏览器会话鉴权在前，业务侧同源校验在后）：`GET /api/acpx-bridge/state`、`POST /api/acpx-bridge/prefs`、`POST /api/acpx-bridge/verify`、`POST /api/acpx-bridge/acpx-check`。
 
 完整说明（接口形状、安全措施、生效时机、默认参数优先级）见 [docs/设置页.md](docs/设置页.md)。
 

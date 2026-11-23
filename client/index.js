@@ -18,6 +18,9 @@
  *
  * Refresh policy: no polling. The page loads once on mount and again on
  * `document.visibilitychange` → visible, plus after every write.
+ *
+ * Transport: writes go to `POST /api/acpx-bridge/prefs` (Connection's Fetch
+ * contract allows GET/HEAD/POST); reads to `GET …/state`.
  */
 
 window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
@@ -169,6 +172,7 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
     resetConfirm: '确认重置？',
     resetDone: '已重置为默认设置',
     docsLabel: 'docs/设置页.md',
+    docsHint: '说明文档（仓库内）：',
     settingsHint: '设置位置：左下角设置 → acpx-bridge',
     summaryLine: 'acpx-bridge 模型桥接',
     agentModels: '模型',
@@ -272,6 +276,7 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
     resetConfirm: 'Confirm reset?',
     resetDone: 'Reset to defaults',
     docsLabel: 'docs/设置页.md',
+    docsHint: 'Documentation in the repository: ',
     settingsHint: 'Location: Settings (bottom-left) → acpx-bridge',
     summaryLine: 'acpx-bridge model bridge',
     agentModels: 'models',
@@ -354,7 +359,6 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
     noticePill: {
       display: 'inline-flex', alignItems: 'center', gap: 6, color: T.ok, fontSize: 12,
     },
-    link: { color: T.info, textDecoration: 'none', fontFamily: T.mono, fontSize: 12 },
     summary: { display: 'flex', flexDirection: 'column', gap: 6, color: T.fg, fontSize: 13 },
   }
 
@@ -519,7 +523,7 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
       if (optimistic && before) set({ data: optimistic(before), busy: label })
       else set({ busy: label })
       try {
-        const payload = await fetchJson('/prefs', { method: 'PUT', body: JSON.stringify(patch) })
+        const payload = await fetchJson('/prefs', { method: 'POST', body: JSON.stringify(patch) })
         applyWrite(payload)
         flash(notice)
         return true
@@ -1244,13 +1248,9 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
         }, confirming ? t('resetConfirm') : t('resetPrefs')),
       ),
       h('div', { style: S.hint },
-        h('a', {
-          href: (state.notes && state.notes.docs) || 'docs/设置页.md',
-          style: S.link,
-          target: '_blank',
-          rel: 'noreferrer',
-        }, (state.notes && state.notes.docs) || t('docsLabel')),
-        ` · ${t('settingsHint')}`,
+        // Plain text on purpose: the GUI has no route serving docs/ setting file,
+        // so a relative link would 404. The path is for humans reading the repo.
+        `${t('docsHint')}${(state.notes && state.notes.docs) || t('docsLabel')} · ${t('settingsHint')}`,
       ),
     )
   }
@@ -1421,6 +1421,6 @@ window.__ModuleLoader__.load({ id: 'dsh-acpx-bridge', factory: require => {
 
   exports.NS = NS
   exports.apply = apply
-  exports.inject = ['slots', 'locale', 'remote']
+  exports.inject = ['slots', 'locale', 'remote', 'remote.credentials']
   return module.exports
 } })

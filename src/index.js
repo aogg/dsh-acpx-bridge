@@ -609,7 +609,10 @@ export async function apply(ctx, config = {}) {
     })
   }
 
-  ctx.inject(['webServer'], (webCtx) => {
+  // The routes live inside Connection's authenticated Fetch registry, not on a
+  // bare Web route: the physical `/api` carrier admits a request (Host/Origin
+  // fence + browser-session auth) before it ever reaches these handlers.
+  ctx.inject(['connection'], (connCtx) => {
     const handlers = createApiHandlers({
       store,
       snapshot,
@@ -618,14 +621,17 @@ export async function apply(ctx, config = {}) {
       onPrefsChanged: () => announceModels(),
       logger,
     })
-    webCtx.effect(
-      () => handlers.routes.map(route => webCtx.webServer.register({
-        kind: 'exact',
-        path: route.path,
-        handler: route.handler,
-      })),
-      'dsh-acpx-bridge: /api/acpx-bridge routes',
-    )
+    for (const route of handlers.routes) {
+      connCtx.effect(
+        () => connCtx.connection.fetch.register({
+          path: route.path,
+          methods: [...route.methods],
+          requestBody: route.requestBody,
+          fetch: route.fetch,
+        }),
+        `dsh-acpx-bridge: ${route.path} Fetch route`,
+      )
+    }
   })
 }
 

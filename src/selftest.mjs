@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildAcpxArgs, buildSessionNewArgs, Config, inject } from './index.js'
+import { apply, buildAcpxArgs, buildSessionNewArgs, Config, inject } from './index.js'
 import {
   allModelIds,
   baseDisplayName,
@@ -46,11 +46,12 @@ import {
   isJsonContentType,
   isSameOrigin,
   parseAcpxVersion,
-  readJsonBody,
+  readRequestJson,
   redactSecrets,
   resolveAcpxPath,
   summarizeProviderError,
   verifyConnection,
+  VERIFY_COOLDOWN_MS,
 } from './api.js'
 
 // inject now includes the llm service
@@ -375,36 +376,48 @@ assert.equal(isJsonContentType({ 'content-type': 'application/json; charset=utf-
 assert.equal(isJsonContentType({ 'content-type': 'text/plain' }), false)
 assert.equal(isJsonContentType({}), false)
 
-function bodyReq(text) {
-  return {
-    async *[Symbol.asyncIterator]() {
-      if (text !== undefined) yield Buffer.from(text)
-    },
-  }
-}
-assert.deepEqual(await readJsonBody(bodyReq(undefined)), { ok: true, value: {} })
-assert.deepEqual(await readJsonBody(bodyReq('{"a":1}')), { ok: true, value: { a: 1 } })
-assert.equal((await readJsonBody(bodyReq('{oops'))).code, 'invalid-json')
-assert.equal((await readJsonBody(bodyReq('[1,2]'))).code, 'invalid-body')
-assert.equal((await readJsonBody(bodyReq('"text"'))).code, 'invalid-body')
-const tooBig = await readJsonBody(bodyReq('{"a":"' + 'x'.repeat(MAX_BODY_BYTES) + '"}'))
-assert.equal(tooBig.ok, false)
-assert.equal(tooBig.code, 'body-too-large')
-
-// an oversized declared Content-Length is refused WITHOUT consuming the stream
-{
-  let consumed = false
-  const declared = await readJsonBody({
-    headers: { 'content-length': String(MAX_BODY_BYTES + 1) },
-    async *[Symbol.asyncIterator]() {
-      consumed = true
-      yield Buffer.from('{}')
-    },
+/** Build the Fetch request the Connection carrier would hand a route handler. */
+function apiRequest(path, { method = 'GET', headers = {}, body } = {}) {
+  return new Request(`http://127.0.0.1:3082${path}`, {
+    method,
+    headers,
+    ...(body === undefined ? {} : { body }),
   })
-  assert.equal(declared.code, 'body-too-large')
-  assert.equal(consumed, false)
 }
 
+assert.deepEqual(await readRequestJson(apiRequest(ROUTES.prefs, { method: 'POST' })), { ok: true, value: {} })
+assert.deepEqual(
+  await readRequestJson(apiRequest(ROUTES.prefs, { method: 'POST', body: '{"a":1}' })),
+  { ok: true, value: { a: 1 } },
+)
+assert.equal(
+  (await readRequestJson(apiRequest(ROUTES.prefs, { method: 'POST', body: '{oops' }))).code,
+  'invalid-json',
+)
+assert.equal(
+  (await readRequestJson(apiRequest(ROUTES.prefs, { method: 'POST', body: '[1,2]' }))).code,
+  'invalid-body',
+)
+{
+  const big = '{"a":"' + 'x'.repeat(MAX_BODY_BYTES) + '"}'
+  const oversized = await readRequestJson(apiRequest(ROUTES.prefs, { method: 'POST', body: big }))
+  assert.equal(oversized.ok, false)
+  assert.equal(oversized.status, 413)
+  assert.equal(oversized.code, 'body-too-large')
+}
+{
+  // declared length over the cap is refused before the body is parsed
+  const declared = await readRequestJson(apiRequest(ROUTES.prefs, {
+    method: 'POST',
+    headers: { 'content-length': String(MAX_BODY_BYTES + 1) },
+    body: '{}',
+  }))
+  assert.equal(declared.code, 'body-too-large')
+}
+
+// ---------------------------------------------------------------------------
+// Verify probe (injected fetch — no network)
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Verify probe (injected fetch — no network)
 // ---------------------------------------------------------------------------
@@ -524,21 +537,6 @@ assert.equal(
 // Atomic preference store (temp directory, real filesystem)
 // ---------------------------------------------------------------------------
 
-function fakeRes() {
-  return {
-    statusCode: 0,
-    headers: {},
-    payload: null,
-    headersSent: false,
-    setHeader(name, value) {
-      this.headers[name.toLowerCase()] = value
-    },
-    end(chunk) {
-      this.payload = chunk === undefined ? '' : JSON.parse(chunk)
-      this.headersSent = true
-    },
-  }
-}
 
 const dir = await mkdtemp(join(tmpdir(), 'acpx-bridge-selftest-'))
 const prefsPath = join(dir, 'storages', 'acpx-bridge', 'prefs.json')
@@ -581,7 +579,7 @@ await reloaded.load()
 assert.deepEqual(reloaded.read().disabledModels, [])
 
 // ---------------------------------------------------------------------------
-// Route handlers over fake req/res (no socket, no network)
+// Route handlers (WHATWG Fetch in / Response out — no socket, no network)
 // ---------------------------------------------------------------------------
 
 const handlerStore = new PrefsStore({
@@ -593,6 +591,7 @@ await handlerStore.load()
 
 let snapshotCalls = 0
 let announced = 0
+let clock = 10_000
 const handlers = createApiHandlers({
   store: handlerStore,
   snapshot: async () => {
@@ -616,79 +615,88 @@ const handlers = createApiHandlers({
     announced += 1
   },
   logger: null,
+  now: () => clock,
 })
+
+// the route descriptors handed to Connection
 assert.deepEqual(handlers.routes.map(route => route.path), [
   ROUTES.state, ROUTES.prefs, ROUTES.verify, ROUTES.acpxCheck,
 ])
+for (const route of handlers.routes) {
+  assert.equal(route.requestBody, 'buffered')
+  assert.equal(typeof route.fetch, 'function')
+  assert.ok(route.methods.length > 0)
+}
+assert.deepEqual(handlers.routes[0].methods, ['GET'])
+assert.deepEqual(handlers.routes.slice(1).map(route => route.methods), [['POST'], ['POST'], ['POST']])
 
 const sameOriginHeaders = { host: '127.0.0.1:3082', origin: 'http://127.0.0.1:3082' }
 
 // GET /state
 {
-  const req = { method: 'GET', headers: { host: '127.0.0.1:3082' } }
-  const res = fakeRes()
-  await handlers.state(req, res)
-  assert.equal(res.statusCode, 200)
-  assert.equal(res.headers['content-type'].startsWith('application/json'), true)
-  assert.equal(res.headers['access-control-allow-origin'], undefined)
-  assert.equal(res.payload.ok, true)
-  assert.equal(res.payload.credential.configured, false)
-  assert.equal(res.payload.counts.total, 4)
+  const response = await handlers.state(apiRequest(ROUTES.state, { headers: { host: '127.0.0.1:3082' } }))
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8')
+  assert.equal(response.headers.get('cache-control'), 'no-store')
+  assert.equal(response.headers.get('access-control-allow-origin'), null)
+  const payload = await response.json()
+  assert.equal(payload.ok, true)
+  assert.equal(payload.credential.configured, false)
+  assert.equal(payload.counts.total, 4)
+  assert.equal(JSON.stringify(payload).includes('apiKey'), false)
+  assert.equal(JSON.stringify(payload).includes('fake-key'), false)
 }
 
-// GET /state from a foreign origin is refused
+// foreign origin is refused
 {
-  const req = { method: 'GET', headers: { host: '127.0.0.1:3082', origin: 'http://evil.test' } }
-  const res = fakeRes()
-  await handlers.state(req, res)
-  assert.equal(res.statusCode, 403)
-  assert.equal(res.payload.error.code, 'cross-origin')
+  const response = await handlers.state(apiRequest(ROUTES.state, {
+    headers: { host: '127.0.0.1:3082', origin: 'http://evil.test' },
+  }))
+  assert.equal(response.status, 403)
+  assert.equal((await response.json()).error.code, 'cross-origin')
 }
 
 // wrong method
 {
-  const req = { method: 'POST', headers: sameOriginHeaders }
-  const res = fakeRes()
-  await handlers.state(req, res)
-  assert.equal(res.statusCode, 405)
+  const response = await handlers.state(apiRequest(ROUTES.state, { method: 'POST', headers: sameOriginHeaders }))
+  assert.equal(response.status, 405)
+  assert.equal((await response.json()).error.code, 'method-not-allowed')
 }
 
-// PUT /prefs without a JSON content type
+// POST /prefs without a JSON content type
 {
-  const req = { method: 'PUT', headers: sameOriginHeaders }
-  const res = fakeRes()
-  await handlers.prefs(req, res)
-  assert.equal(res.statusCode, 415)
-  assert.equal(res.payload.error.code, 'unsupported-media-type')
+  const response = await handlers.prefs(apiRequest(ROUTES.prefs, {
+    method: 'POST',
+    headers: sameOriginHeaders,
+  }))
+  assert.equal(response.status, 415)
+  assert.equal((await response.json()).error.code, 'unsupported-media-type')
 }
 
-// PUT /prefs from a foreign origin
+// POST /prefs from a foreign origin
 {
-  const req = {
-    method: 'PUT',
+  const response = await handlers.prefs(apiRequest(ROUTES.prefs, {
+    method: 'POST',
     headers: { host: '127.0.0.1:3082', origin: 'http://evil.test', 'content-type': 'application/json' },
-    ...bodyReq('{"disabledModels":["gs/x"]}'),
-  }
-  const res = fakeRes()
-  await handlers.prefs(req, res)
-  assert.equal(res.statusCode, 403)
+    body: '{"disabledModels":["gs/x"]}',
+  }))
+  assert.equal(response.status, 403)
   assert.deepEqual(handlerStore.read().disabledModels, [])
 }
 
-// PUT /prefs happy path: validated write + announcement + echoed state
+// POST /prefs happy path: validated write + announcement + echoed state
 {
-  const req = {
-    method: 'PUT',
+  const response = await handlers.prefs(apiRequest(ROUTES.prefs, {
+    method: 'POST',
     headers: { ...sameOriginHeaders, 'content-type': 'application/json' },
-    ...bodyReq('{"disabledModels":["my/opencode/b-free"],"defaults":{"timeoutMs":99999999}}'),
-  }
-  const res = fakeRes()
-  await handlers.prefs(req, res)
-  assert.equal(res.statusCode, 200)
-  assert.equal(res.payload.ok, true)
-  assert.deepEqual(res.payload.prefs.disabledModels, ['my/opencode/b-free'])
-  assert.equal(res.payload.prefs.defaults.timeoutMs, TIMEOUT_MAX_MS) // clamped
-  assert.equal(res.payload.state.counts.enabled, 3)
+    body: '{"disabledModels":["my/opencode/b-free"],"defaults":{"timeoutMs":99999999}}',
+  }))
+  assert.equal(response.status, 200)
+  const payload = await response.json()
+  assert.equal(payload.ok, true)
+  assert.deepEqual(payload.prefs.disabledModels, ['my/opencode/b-free'])
+  assert.equal(payload.prefs.defaults.timeoutMs, TIMEOUT_MAX_MS) // clamped
+  assert.equal(payload.state.counts.enabled, 3)
   assert.deepEqual(handlerStore.read().disabledModels, ['my/opencode/b-free'])
   assert.equal(announced, 1)
   assert.equal(snapshotCalls > 0, true)
@@ -697,57 +705,145 @@ const sameOriginHeaders = { host: '127.0.0.1:3082', origin: 'http://127.0.0.1:30
 // the disabled model is now refused by the delegate tool's pre-execution guard
 assert.equal(isModelDisabled(handlerStore.read(), 'my/opencode/b-free'), true)
 
-// PUT /prefs { reset: true } restores defaults
+// POST /prefs { reset: true } restores defaults
 {
-  const req = {
-    method: 'PUT',
+  const response = await handlers.prefs(apiRequest(ROUTES.prefs, {
+    method: 'POST',
     headers: { ...sameOriginHeaders, 'content-type': 'application/json' },
-    ...bodyReq('{"reset":true}'),
-  }
-  const res = fakeRes()
-  await handlers.prefs(req, res)
-  assert.equal(res.statusCode, 200)
-  assert.deepEqual(res.payload.prefs.disabledModels, [])
+    body: '{"reset":true}',
+  }))
+  assert.equal(response.status, 200)
+  assert.deepEqual((await response.json()).prefs.disabledModels, [])
 }
 
-// PUT /prefs body over the cap
+// POST /prefs body over the cap
 {
-  const req = {
-    method: 'PUT',
+  const response = await handlers.prefs(apiRequest(ROUTES.prefs, {
+    method: 'POST',
     headers: { ...sameOriginHeaders, 'content-type': 'application/json' },
-    ...bodyReq('{"x":"' + 'y'.repeat(MAX_BODY_BYTES + 1) + '"}'),
-  }
-  const res = fakeRes()
-  await handlers.prefs(req, res)
-  assert.equal(res.statusCode, 413)
-  assert.equal(res.payload.error.code, 'body-too-large')
+    body: '{"x":"' + 'y'.repeat(MAX_BODY_BYTES + 1) + '"}',
+  }))
+  assert.equal(response.status, 413)
+  assert.equal((await response.json()).error.code, 'body-too-large')
 }
 
-// POST /verify
+// POST /verify: first accepted, immediate second is 429 (cooldown), later one is accepted
 {
-  const req = { method: 'POST', headers: sameOriginHeaders, resume() {} }
-  const res = fakeRes()
-  await handlers.verify(req, res)
-  assert.equal(res.statusCode, 200)
-  assert.deepEqual(res.payload, { ok: true, latencyMs: 12, model: 'm', status: 200, error: '' })
+  const first = await handlers.verify(apiRequest(ROUTES.verify, { method: 'POST', headers: sameOriginHeaders }))
+  assert.equal(first.status, 200)
+  assert.deepEqual(await first.json(), { ok: true, latencyMs: 12, model: 'm', status: 200, error: '' })
+
+  clock += 500 // still inside the 2s cooldown
+  const second = await handlers.verify(apiRequest(ROUTES.verify, { method: 'POST', headers: sameOriginHeaders }))
+  assert.equal(second.status, 429)
+  const secondPayload = await second.json()
+  assert.equal(secondPayload.error.code, 'verify-too-frequent')
+  assert.deepEqual(Object.keys(secondPayload), ['error']) // error envelope only, no state
+
+  clock += VERIFY_COOLDOWN_MS
+  const third = await handlers.verify(apiRequest(ROUTES.verify, { method: 'POST', headers: sameOriginHeaders }))
+  assert.equal(third.status, 200)
+}
+
+// concurrent verify: while one is in flight the next is refused
+{
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const slowHandlers = createApiHandlers({
+    store: handlerStore,
+    snapshot: async () => ({}),
+    verify: async () => {
+      await gate
+      return { ok: true, latencyMs: 1, model: 'm', status: 200, error: '' }
+    },
+    acpxCheck: async () => ({}),
+    logger: null,
+    now: () => 0,
+  })
+  const firstPromise = slowHandlers.verify(apiRequest(ROUTES.verify, { method: 'POST', headers: sameOriginHeaders }))
+  const second = await slowHandlers.verify(apiRequest(ROUTES.verify, { method: 'POST', headers: sameOriginHeaders }))
+  assert.equal(second.status, 429)
+  release()
+  assert.equal((await firstPromise).status, 200)
 }
 
 // POST /acpx-check
 {
-  const req = { method: 'POST', headers: sameOriginHeaders, resume() {} }
-  const res = fakeRes()
-  await handlers.acpxCheck(req, res)
-  assert.equal(res.statusCode, 200)
-  assert.equal(res.payload.ok, true)
-  assert.equal(res.payload.path, '/usr/local/bin/acpx')
+  const response = await handlers.acpxCheck(apiRequest(ROUTES.acpxCheck, { method: 'POST', headers: sameOriginHeaders }))
+  assert.equal(response.status, 200)
+  const payload = await response.json()
+  assert.equal(payload.ok, true)
+  assert.equal(payload.path, '/usr/local/bin/acpx')
 }
 
 // POST routes are same-origin gated too
 {
-  const req = { method: 'POST', headers: { host: '127.0.0.1:3082', origin: 'http://evil.test' }, resume() {} }
-  const res = fakeRes()
-  await handlers.verify(req, res)
-  assert.equal(res.statusCode, 403)
+  const response = await handlers.verify(apiRequest(ROUTES.verify, {
+    method: 'POST',
+    headers: { host: '127.0.0.1:3082', origin: 'http://evil.test' },
+  }))
+  assert.equal(response.status, 403)
 }
 
-console.log('✓ dsh-acpx-bridge selftest passed (config, adapter, prefs, model filtering, HTTP fence, verify/acpx probes, tool-call SSE, command building)')
+// ---------------------------------------------------------------------------
+// Plugin wiring: Connection Fetch routes registered through a fake connection
+// ---------------------------------------------------------------------------
+
+{
+  const registeredRoutes = []
+  const emitted = []
+  const fakeConnectionContext = (ctx) => Object.assign(Object.create(ctx), {
+    connection: {
+      fetch: {
+        register(route) {
+          registeredRoutes.push(route)
+          return async () => {}
+        },
+      },
+    },
+  })
+  const pluginCtx = {
+    logger: () => ({ warn: () => {}, debug: () => {}, info: () => {} }),
+    effect(fn) {
+      fn()
+      return () => {}
+    },
+    on() { return () => {} },
+    emit(event, ...args) { emitted.push([event, ...args]) },
+    get() { return undefined },
+    inject(deps, callback) {
+      if (deps.includes('connection')) callback(fakeConnectionContext(pluginCtx))
+    },
+    tools: { register() {} },
+    llm: { registerAdapter() {} },
+  }
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = await mkdtemp(join(tmpdir(), 'acpx-bridge-wiring-'))
+  try {
+    await apply(pluginCtx, Config({ tools, wireModels: {} }))
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+  assert.deepEqual(registeredRoutes.map(route => route.path), [
+    ROUTES.state, ROUTES.prefs, ROUTES.verify, ROUTES.acpxCheck,
+  ])
+  for (const route of registeredRoutes) {
+    assert.deepEqual(Object.keys(route).sort(), ['fetch', 'methods', 'path', 'requestBody'])
+    assert.equal(route.requestBody, 'buffered')
+    assert.equal(typeof route.fetch, 'function')
+  }
+  assert.deepEqual(registeredRoutes.map(route => route.methods), [['GET'], ['POST'], ['POST'], ['POST']])
+  assert.ok(emitted.some(event => event[0] === 'llm/adapters-updated'))
+
+  // the real registered handler answers a Fetch request
+  const stateRoute = registeredRoutes.find(route => route.path === ROUTES.state)
+  const response = await stateRoute.fetch(apiRequest(ROUTES.state, { headers: { host: '127.0.0.1:3082' } }))
+  assert.equal(response.status, 200)
+  const payload = await response.json()
+  assert.equal(payload.provider, 'acpx-bridge')
+  assert.equal(payload.counts.total, 4)
+  assert.equal(JSON.stringify(payload).includes('apiKey'), false)
+}
+
+console.log('✓ dsh-acpx-bridge selftest passed (config, adapter, prefs, model filtering, Fetch route fence + handlers, verify cooldown + probes, tool-call SSE, command building)')
