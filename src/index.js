@@ -8,20 +8,49 @@
  *   model (inside dsh)  --calls-->  acpx_delegate tool  --spawns-->  acpx <agent> exec "<task>"
  *
  * It also registers an LLM adapter so configured models appear in dsh's model
- * selector and real calls go to an OpenAI-compatible endpoint (see config.js).
+ * selector and real calls go to an OpenAI-compatible endpoint (see config.js),
+ * plus the HTTP surface behind the browser settings page (see api.js).
  *
- * Why a tool instead of a subagent provider:
- *   acpx itself is an ACP *client* with 30 built-in agent profiles and a stable
- *   one-shot `exec` command. Wrapping it as a single tool is the smallest, most
- *   robust integration and keeps the whole CLI surface (agent choice, --cwd,
- *   permission policy, --format json) available to the model.
+ * Persistence split (deliberate):
+ *   - model/endpoint/parameter preferences -> `<DSH_HOME>/storages/acpx-bridge/prefs.json`
+ *     (own JSON document, atomic write; never the profile's cordis.patch.yml);
+ *   - the API key -> the harness credential seam only (`ACPX_BRIDGE_API_KEY`),
+ *     so it is never written into a settings file and never returned to a browser.
  */
 
 import { execFile } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { Config, PROVIDER, allModelIds, resolveConfig } from './config.js'
+import {
+  API_KEY_ENV,
+  Config,
+  PROVIDER,
+  allModelIds,
+  endpointInfo,
+  readConfigValue,
+  resolveConfig,
+  toWireModel,
+} from './config.js'
 import { AcpxBridgeAdapter } from './llm-adapter.js'
+import {
+  DEFAULT_PREFS,
+  PrefsStore,
+  TIMEOUT_DEFAULT_MS,
+  TIMEOUT_MAX_MS,
+  TIMEOUT_MIN_MS,
+  enabledModelIds,
+  isModelDisabled,
+  isPlaceholderModel,
+  modelDisplayName,
+} from './prefs.js'
+import {
+  ACPX_CHECK_TIMEOUT_MS,
+  buildState,
+  checkAcpx,
+  createApiHandlers,
+  verifyConnection,
+} from './api.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -37,9 +66,10 @@ const ACPX_BIN = process.env.ACPX_BIN || 'acpx'
 const DEFAULT_AGENT = process.env.ACPX_DEFAULT_AGENT || 'codex'
 const DEFAULT_FORMAT = 'quiet' // quiet | json | text
 const DEFAULT_APPROVE = 'reads' // reads | all | none
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 const MAX_STDOUT_CHARS = 200_000
 const MAX_RENDER_CHARS = 12_000
+/** How long one acpx probe answer is reused before `--version` runs again. */
+const ACPX_CACHE_MS = 10_000
 
 // acpx built-in profile names (see https://acpx.sh/agents.html) — exposed to
 // the model as a hint only; any custom ACP server works via `--agent`.
@@ -50,6 +80,18 @@ const KNOWN_AGENTS = [
   'deepseek-harness', 'devin', 'factory', 'fast-agent', 'fx', 'grok-build',
   'antigravity', 'ante', 'octomind',
 ]
+
+/** Read this package's version for the settings page. */
+function readPluginVersion(logger) {
+  try {
+    const raw = readFileSync(new URL('../package.json', import.meta.url), 'utf8')
+    const parsed = JSON.parse(raw)
+    return typeof parsed?.version === 'string' ? parsed.version : '0.0.0'
+  } catch (error) {
+    logger?.warn?.(`[acpx-bridge] unable to read package.json version: ${error?.message ?? error}`)
+    return '0.0.0'
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Pure command builder (unit-testable without acpx installed)
@@ -121,22 +163,147 @@ function truncateForStore(text) {
 // Plugin
 // ---------------------------------------------------------------------------
 
-export function apply(ctx, config = {}) {
+export async function apply(ctx, config = {}) {
+  const logger = typeof ctx.logger === 'function' ? ctx.logger('dsh-acpx-bridge') : (ctx.logger ?? console)
+  const version = readPluginVersion(logger)
+
+  // Own preference document, loaded once; every later read is a snapshot.
+  const store = new PrefsStore({ logger })
+  await store.load()
+
   const options = resolveConfig(config)
   const tools = options.tools
   const agentChoices = tools.length ? tools.map(tool => tool.name) : KNOWN_AGENTS
   const defaultAgent = agentChoices[0] || DEFAULT_AGENT
   const modelIds = allModelIds(tools)
-  const modelsByAgent = new Map(tools.map(tool => [tool.name, tool.models ?? []]))
+
+  /** The credential seam is optional: the plugin works with Config only. */
+  const getCredentials = () => (typeof ctx.get === 'function' ? ctx.get('credentials') : undefined)
+
+  /** API key precedence: Config (may be env-injected) > credential store > ''. */
+  async function resolveApiKey() {
+    const current = resolveConfig(config)
+    if (current.apiKey) return current.apiKey
+    const credentials = getCredentials()
+    if (!credentials || typeof credentials.resolve !== 'function') return ''
+    try {
+      const resolved = await credentials.resolve(API_KEY_ENV)
+      return typeof resolved?.value === 'string' ? resolved.value : ''
+    } catch (error) {
+      logger?.warn?.(`[acpx-bridge] credential resolve failed: ${error?.message ?? error}`)
+      return ''
+    }
+  }
+
+  /**
+   * Presence-only credential view for the page (never the value):
+   * `{ ref, configured, source, writable }`.
+   */
+  async function credentialView() {
+    const view = { ref: API_KEY_ENV, configured: false, source: '', writable: true }
+    const credentials = getCredentials()
+    if (credentials && typeof credentials.describe === 'function') {
+      try {
+        const info = await credentials.describe(API_KEY_ENV)
+        view.configured = info?.configured === true
+        view.source = typeof info?.source === 'string' ? info.source : ''
+        view.writable = info?.writable !== false
+      } catch (error) {
+        logger?.warn?.(`[acpx-bridge] credential describe failed: ${error?.message ?? error}`)
+      }
+    }
+    // A key injected through the cordis config (usually `!!js process.env.…`)
+    // cannot be edited from the browser: the config layer wins over the store.
+    const configKey = readConfigValue(config.apiKey)
+    const envKey = typeof process.env[API_KEY_ENV] === 'string' ? process.env[API_KEY_ENV] : ''
+    if (typeof configKey === 'string' && configKey) {
+      view.configured = true
+      view.source = 'config'
+      view.writable = false
+    } else if (envKey) {
+      view.configured = true
+      if (!view.source) view.source = 'env'
+      view.writable = false
+    }
+    if (!view.configured) view.source = ''
+    return view
+  }
+
+  /**
+   * Effective endpoint + where it came from; the page override wins.
+   * `fallback` is what applies once the override is cleared, so the page can
+   * tell the user which endpoint "reset to default" actually returns to.
+   */
+  function endpointView(prefs) {
+    const base = endpointInfo(config)
+    if (prefs.baseURLOverride) {
+      return { effective: prefs.baseURLOverride, source: 'prefs', fallback: base.effective }
+    }
+    return base
+  }
+
+  let acpxCache = { at: 0, value: null }
+
+  /** Cached `acpx --version` probe; `force` bypasses the cache. */
+  async function acpxStatus({ force = false } = {}) {
+    const now = Date.now()
+    if (!force && acpxCache.value && now - acpxCache.at < ACPX_CACHE_MS) return acpxCache.value
+    const probed = await checkAcpx({ bin: ACPX_BIN, timeoutMs: ACPX_CHECK_TIMEOUT_MS })
+    const value = { bin: ACPX_BIN, ...probed }
+    acpxCache = { at: Date.now(), value }
+    return value
+  }
+
+  /** One `/state` body: everything the settings page renders. */
+  async function snapshot() {
+    const current = resolveConfig(config)
+    const prefs = store.read()
+    return buildState({
+      version,
+      provider: PROVIDER,
+      entryId: name,
+      endpoint: endpointView(prefs),
+      credential: await credentialView(),
+      acpx: await acpxStatus(),
+      prefs,
+      wireModels: current.wireModels ?? {},
+      notes: {
+        configSource: 'profile cordis 配置（cordis.patch.yml / --patch）',
+        docs: 'docs/设置页.md',
+      },
+      tools: current.tools,
+    })
+  }
+
+  /**
+   * Tell the host's model catalogue to re-read the adapters, so the model
+   * selector reflects a just-toggled model without a reload.
+   * `llm/adapters-updated` is what this dsh build actually forwards to the
+   * client; `llm/models-updated` is emitted as the task-level compatibility
+   * name for external watchers.
+   */
+  function announceModels() {
+    ctx.emit('llm/adapters-updated')
+    ctx.emit('llm/models-updated', PROVIDER)
+  }
 
   // Register the LLM adapter so configured models appear in dsh's model selector.
   const adapter = new AcpxBridgeAdapter({
-    ...options,
     tools: () => resolveConfig(config).tools,
+    prefs: () => store.read(),
+    resolveConnection: async () => {
+      const current = resolveConfig(config)
+      const prefs = store.read()
+      return {
+        baseURL: prefs.baseURLOverride || current.baseURL,
+        apiKey: await resolveApiKey(),
+        wireModels: current.wireModels ?? {},
+      }
+    },
   })
   ctx.llm.registerAdapter([PROVIDER], adapter)
-  ctx.emit('llm/models-updated', PROVIDER)
-  ctx.on('loader/volatile-update', () => ctx.emit('llm/models-updated', PROVIDER))
+  announceModels()
+  ctx.on('loader/volatile-update', () => announceModels())
 
   ctx.tools.register(defineTool({
     name: 'acpx_delegate',
@@ -145,6 +312,7 @@ export function apply(ctx, config = {}) {
       'Use this to parallelise work or hand a task to a specialised agent. ' +
       `Configured agents: ${agentChoices.join(', ')}. ` +
       `Agent → models: ${tools.map(tool => `${tool.name}=[${(tool.models ?? []).join(', ')}]`).join('; ') || 'none'}. ` +
+      'Models may be switched off on the acpx-bridge settings page; a switched-off model is refused here. ' +
       'Pass a self-contained task description — the child agent cannot see this conversation. ' +
       'For a throwaway run keep mode=exec; use mode=session with a `session` name to keep ' +
       'a persistent, resumable conversation scoped to the repo. ' +
@@ -158,7 +326,7 @@ export function apply(ctx, config = {}) {
       agent: {
         type: 'string',
         enum: agentChoices,
-        description: `Configured command tool (acpx agent profile). Defaults to ${defaultAgent}.`,
+        description: `Configured command tool (acpx agent profile). Defaults to the settings-page default, else ${defaultAgent}.`,
       },
       model: {
         type: 'string',
@@ -172,7 +340,7 @@ export function apply(ctx, config = {}) {
       mode: {
         type: 'string',
         enum: ['exec', 'session'],
-        description: 'exec = one-shot stateless run; session = persistent named conversation.',
+        description: 'exec = one-shot stateless run; session = persistent named conversation. Defaults to the settings-page default.'
       },
       session: {
         type: 'string',
@@ -181,16 +349,16 @@ export function apply(ctx, config = {}) {
       approve: {
         type: 'string',
         enum: ['reads', 'all', 'none'],
-        description: 'Permission policy: reads (default, auto-approve reads), all (auto-approve everything), none (deny all tool calls).',
+        description: 'Permission policy: reads (auto-approve reads), all (auto-approve everything), none (deny all tool calls). Defaults to the settings-page default, else reads.',
       },
       format: {
         type: 'string',
         enum: ['quiet', 'json', 'text'],
-        description: 'Output format: quiet (final assistant text, default), json (NDJSON ACP events), text (human readable).',
+        description: 'Output format: quiet (final assistant text), json (NDJSON ACP events), text (human readable). Defaults to the settings-page default, else quiet.',
       },
       timeoutMs: {
         type: 'number',
-        description: `Timeout in milliseconds. Default ${DEFAULT_TIMEOUT_MS}.`,
+        description: `Timeout in milliseconds (${TIMEOUT_MIN_MS}..${TIMEOUT_MAX_MS}). Default ${TIMEOUT_DEFAULT_MS}, or the settings-page default.`,
       },
     },
     output: {
@@ -220,16 +388,21 @@ export function apply(ctx, config = {}) {
     },
     async execute(args, exec) {
       const started = Date.now()
+      const prefs = store.read()
+      const settingsDefaults = prefs.defaults ?? DEFAULT_PREFS.defaults
+      const configuredAgent = settingsDefaults.agent && agentChoices.includes(settingsDefaults.agent)
+        ? settingsDefaults.agent
+        : defaultAgent
       const {
         task,
-        agent = defaultAgent,
+        agent = configuredAgent,
         model,
         cwd,
-        mode = 'exec',
+        mode = settingsDefaults.mode,
         session,
-        approve = DEFAULT_APPROVE,
-        format = DEFAULT_FORMAT,
-        timeoutMs = DEFAULT_TIMEOUT_MS,
+        approve = settingsDefaults.approve,
+        format = settingsDefaults.format,
+        timeoutMs = settingsDefaults.timeoutMs,
       } = args
 
       const base = {
@@ -243,9 +416,18 @@ export function apply(ctx, config = {}) {
         durationMs: 0,
       }
 
-      // Reject a model that is not declared under the selected command tool.
+      // A model switched off on the settings page is refused here: the tool's
+      // `enum` cannot be updated live, so execution is the enforcement point.
       if (model) {
-        const allowed = modelsByAgent.get(agent) ?? []
+        if (isModelDisabled(prefs, model)) {
+          return {
+            ...base,
+            ok: false,
+            diagnostic: `model "${model}" 已在 acpx-bridge 设置页停用（模型显示 → 开关）；请换用其它模型或在设置页重新启用`,
+            durationMs: Date.now() - started,
+          }
+        }
+        const allowed = (new Map(resolveConfig(config).tools.map(tool => [tool.name, tool.models ?? []]))).get(agent) ?? []
         if (allowed.length && !allowed.includes(model)) {
           return {
             ...base,
@@ -260,12 +442,13 @@ export function apply(ctx, config = {}) {
       if (mode === 'session' && session) {
         try {
           await execFileAsync(ACPX_BIN, buildSessionNewArgs(agent, session), {
-            timeout: Math.min(timeoutMs, 30_000),
+            timeout: Math.min(Number(timeoutMs), 30_000),
             signal: exec.signal,
             maxBuffer: 1024 * 1024,
           })
-        } catch {
-          // Session may already exist — the send below still works. Ignore.
+        } catch (error) {
+          // Session may already exist — the send below still works.
+          logger?.debug?.(`[acpx-bridge] session pre-create skipped: ${error?.message ?? error}`)
         }
       }
 
@@ -328,7 +511,7 @@ export function apply(ctx, config = {}) {
   // A small companion tool: list configured command tools + their models.
   ctx.tools.register(defineTool({
     name: 'acpx_agents',
-    description: 'List configured acpx command tools (agents), their models, and built-in agent profiles.',
+    description: 'List configured acpx command tools (agents), their models and whether each model is enabled, plus built-in agent profiles.',
     parameters: {},
     output: {
       schema: {
@@ -340,7 +523,21 @@ export function apply(ctx, config = {}) {
               type: 'object',
               properties: {
                 name: { type: 'string' },
-                models: { type: 'array', items: { type: 'string' } },
+                models: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string' },
+                      name: { type: 'string' },
+                      enabled: { type: 'boolean' },
+                      placeholder: { type: 'boolean' },
+                    },
+                    additionalProperties: false,
+                  },
+                },
+                enabledCount: { type: 'number' },
+                totalCount: { type: 'number' },
               },
               additionalProperties: false,
             },
@@ -355,21 +552,81 @@ export function apply(ctx, config = {}) {
         {
           type: 'text',
           text: `${value.count} configured tools:\n`
-            + value.tools.map(tool => `- ${tool.name}: ${tool.models.join(', ') || '(no models)'}`).join('\n')
+            + value.tools.map(tool =>
+              `- ${tool.name} (${tool.enabledCount}/${tool.totalCount} enabled): `
+              + (tool.models.length
+                ? tool.models.map(model => `${model.enabled ? '✓' : '✗'} ${model.id}`).join(', ')
+                : '(no models)'),
+            ).join('\n')
             + `\n\nBuilt-in acpx agents: ${value.known.join(', ')}\n\n${value.note}`,
         },
       ],
     },
     async execute() {
       const current = resolveConfig(config).tools
+      const prefs = store.read()
+      const currentTools = current.map(tool => {
+        const models = (tool.models ?? []).map(id => ({
+          id,
+          name: modelDisplayName(id, current, prefs),
+          enabled: !isModelDisabled(prefs, id),
+          placeholder: isPlaceholderModel(id),
+        }))
+        return {
+          name: tool.name,
+          models,
+          enabledCount: models.filter(model => model.enabled).length,
+          totalCount: models.length,
+        }
+      })
       return {
-        tools: current,
+        tools: currentTools,
         known: KNOWN_AGENTS,
-        count: current.length,
-        note: `Using acpx binary: ${ACPX_BIN}. LLM provider: ${PROVIDER}.`,
+        count: currentTools.length,
+        note: `Using acpx binary: ${ACPX_BIN}. LLM provider: ${PROVIDER}. Preferences: ${store.file}.`,
       }
     },
   }))
+
+  // -------------------------------------------------------------------------
+  // Settings-page HTTP surface (only when this deployment has a Web server)
+  // -------------------------------------------------------------------------
+
+  /** Probe the effective endpoint with the effective key. */
+  async function verifyCurrentConnection() {
+    const current = resolveConfig(config)
+    const prefs = store.read()
+    const enabled = enabledModelIds(current.tools, prefs)
+    const model = enabled[0] ?? allModelIds(current.tools)[0] ?? ''
+    if (!model) {
+      return { ok: false, latencyMs: 0, model: '', status: 0, error: '没有配置任何模型，无法测试连接' }
+    }
+    return verifyConnection({
+      baseURL: endpointView(prefs).effective,
+      apiKey: await resolveApiKey(),
+      model: toWireModel(model, current.wireModels),
+      logger,
+    })
+  }
+
+  ctx.inject(['webServer'], (webCtx) => {
+    const handlers = createApiHandlers({
+      store,
+      snapshot,
+      verify: verifyCurrentConnection,
+      acpxCheck: acpxStatus,
+      onPrefsChanged: () => announceModels(),
+      logger,
+    })
+    webCtx.effect(
+      () => handlers.routes.map(route => webCtx.webServer.register({
+        kind: 'exact',
+        path: route.path,
+        handler: route.handler,
+      })),
+      'dsh-acpx-bridge: /api/acpx-bridge routes',
+    )
+  })
 }
 
 export default { name, inject, apply }

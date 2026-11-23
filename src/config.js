@@ -53,6 +53,15 @@ function read(value) {
   return value && typeof value.get === 'function' ? value.get() : value
 }
 
+/** Public form of {@link read}: volatile reference or plain value. */
+export function readConfigValue(value) {
+  return read(value)
+}
+
+function trimTrailingSlashes(value) {
+  return String(value).replace(/\/+$/, '')
+}
+
 /**
  * Turn the cordis Config (volatile refs or plain values) into plain options.
  * Environment variables take precedence only when the config value is blank,
@@ -63,7 +72,25 @@ export function resolveConfig(config = {}) {
   const wireModels = read(config.wireModels) ?? {}
   const apiKey = read(config.apiKey) || process.env[API_KEY_ENV] || ''
   const baseURL = read(config.baseURL) || process.env[BASE_URL_ENV] || DEFAULT_BASE_URL
-  return { tools, wireModels, apiKey, baseURL: baseURL.replace(/\/+$/, '') }
+  return { tools, wireModels, apiKey, baseURL: trimTrailingSlashes(baseURL) }
+}
+
+/**
+ * Where the endpoint came from, for the settings page's source label.
+ * The page-level override is applied on top of this by src/index.js.
+ * @param config - raw cordis config (volatile refs or plain values).
+ * @returns `{ effective, source, fallback }`, source one of config/env/default.
+ */
+export function endpointInfo(config = {}) {
+  const configured = read(config.baseURL)
+  if (typeof configured === 'string' && configured.trim()) {
+    return { effective: trimTrailingSlashes(configured.trim()), source: 'config', fallback: DEFAULT_BASE_URL }
+  }
+  const fromEnv = process.env[BASE_URL_ENV]
+  if (typeof fromEnv === 'string' && fromEnv.trim()) {
+    return { effective: trimTrailingSlashes(fromEnv.trim()), source: 'env', fallback: DEFAULT_BASE_URL }
+  }
+  return { effective: DEFAULT_BASE_URL, source: 'default', fallback: DEFAULT_BASE_URL }
 }
 
 /** Deduplicated list of every model id declared under every command tool. */
