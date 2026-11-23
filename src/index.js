@@ -51,6 +51,10 @@ import {
   createApiHandlers,
   verifyConnection,
 } from './api.js'
+import { AGENTS, probeAgent } from './agents.js'
+import { createAgentHandlers } from './agent-api.js'
+import { readAgentSecrets } from './agent-keys.js'
+import { createJobStore } from './agent-jobs.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -70,6 +74,8 @@ const MAX_STDOUT_CHARS = 200_000
 const MAX_RENDER_CHARS = 12_000
 /** How long one acpx probe answer is reused before `--version` runs again. */
 const ACPX_CACHE_MS = 10_000
+/** How long the seven-platform authorization probe is cached. */
+const AGENTS_CACHE_MS = 30_000
 
 // acpx built-in profile names (see https://acpx.sh/agents.html) — exposed to
 // the model as a hint only; any custom ACP server works via `--agent`.
@@ -273,6 +279,76 @@ export async function apply(ctx, config = {}) {
       },
       tools: current.tools,
     })
+  }
+
+  // -------------------------------------------------------------------------
+  // Command-tool authorization (the seven installed platform CLIs)
+  // -------------------------------------------------------------------------
+
+  // One child process per interactive authorization. The job Map lives in this
+  // apply() closure on purpose: a plugin unload cannot leave a CLI waiting for
+  // input forever, and no two login jobs can exist for the same platform.
+  const loginJobs = createJobStore({ logger })
+  ctx.effect(() => () => loginJobs.killAll(), 'dsh-acpx-bridge: login job cleanup')
+
+  let agentsCache = { at: 0, value: null }
+  /** One probe batch at a time: a second request reuses the running batch. */
+  let agentsInFlight = null
+
+  /**
+   * Probe the seven platform CLIs concurrently. One slow or absent CLI cannot
+   * delay the others: each probe owns its timeout and returns a result object
+   * instead of throwing. Results are cached for {@link AGENTS_CACHE_MS}; a
+   * credential write invalidates the cache and `?force=1` bypasses it.
+   *
+   * Overlapping requests are de-duplicated (the settings page and the plugins
+   * card both mount on load), so at most one batch of 7 subprocesses runs at a
+   * time, and a double-clicked 「全部检测」 reuses the batch already running.
+   */
+  async function agentsStatus({ force = false } = {}) {
+    const startedAt = Date.now()
+    if (!force && agentsCache.value !== null && startedAt - agentsCache.at < AGENTS_CACHE_MS) {
+      return agentsCache.value
+    }
+    if (agentsInFlight !== null) return agentsInFlight
+    agentsInFlight = (async () => {
+      const probed = await Promise.all(AGENTS.map(async spec => {
+        try {
+          return await probeAgent(spec, { logger })
+        } catch (error) {
+          // probeAgent is documented as non-throwing; this is the last line of
+          // defence so one broken CLI cannot blank the whole page.
+          logger?.warn?.(`[acpx-bridge] agent probe ${spec.id} threw: ${error?.message ?? error}`)
+          return {
+            id: spec.id,
+            name: spec.name,
+            bin: spec.bin,
+            installed: false,
+            version: '',
+            state: 'unknown',
+            method: spec.auth?.kind ?? 'unknown',
+            detail: `探测异常：${error?.message ?? error}`,
+            actions: [],
+            models: null,
+            docs: spec.docs ?? '',
+            error: String(error?.message ?? error),
+          }
+        }
+      }))
+      const value = { ok: true, agents: probed, probedAt: Date.now() }
+      agentsCache = { at: Date.now(), value }
+      return value
+    })()
+    try {
+      return await agentsInFlight
+    } finally {
+      agentsInFlight = null
+    }
+  }
+
+  /** A credential write/removal makes the cached probe stale. */
+  function invalidateAgents() {
+    agentsCache = { at: 0, value: null }
   }
 
   /**
@@ -622,6 +698,27 @@ export async function apply(ctx, config = {}) {
       logger,
     })
     for (const route of handlers.routes) {
+      connCtx.effect(
+        () => connCtx.connection.fetch.register({
+          path: route.path,
+          methods: [...route.methods],
+          requestBody: route.requestBody,
+          fetch: route.fetch,
+        }),
+        `dsh-acpx-bridge: ${route.path} Fetch route`,
+      )
+    }
+
+    // The seven-platform authorization surface (see agent-api.js for why the
+    // agent id travels in the query/body instead of a `:id` path segment).
+    const agentHandlers = createAgentHandlers({
+      agentsStatus,
+      jobs: loginJobs,
+      onChanged: invalidateAgents,
+      logger,
+      secretsFor: spec => readAgentSecrets(spec, { logger }),
+    })
+    for (const route of agentHandlers.routes) {
       connCtx.effect(
         () => connCtx.connection.fetch.register({
           path: route.path,
